@@ -7,6 +7,7 @@ Options:
   3. Daily Login — click "RECEBER ITEM" on dailylogin
   4. All of the above (in order: 1 → 2 → 3), no pause
   5. All of the above, pausing after dado click (wait for your input to continue)
+  6. Check-in + Dado do Dia only (no daily login), pausing after dado click
 """
 
 import io
@@ -54,11 +55,12 @@ def ask_option() -> int:
     log("3. Daily Login — click 'RECEBER ITEM' (dailylogin)", YELLOW)
     log("4. All of the above", YELLOW)
     log("5. All of the above, pausing after dado click (wait for your input to continue)", YELLOW)
+    log("6. Check-in + Dado do Dia only (no daily login), pausing after dado click", YELLOW)
     while True:
-        choice = input("\nChoose an option (1/2/3/4/5): ").strip()
-        if choice in ("1", "2", "3", "4", "5"):
+        choice = input("\nChoose an option (1/2/3/4/5/6): ").strip()
+        if choice in ("1", "2", "3", "4", "5", "6"):
             return int(choice)
-        log("Invalid choice. Please enter 1, 2, 3, 4, or 5.", RED)
+        log("Invalid choice. Please enter 1, 2, 3, 4, 5, or 6.", RED)
 
 
 # ── shared helpers ────────────────────────────────────────────────────────────
@@ -419,6 +421,7 @@ async def main():
         3: ["dailylogin"],
         4: ["checkin", "dado", "dailylogin"],
         5: ["checkin", "dado_pause", "dailylogin"],
+        6: ["checkin", "dado_pause"],
     }
     tasks = task_map[option]
 
