@@ -1,0 +1,6 @@
+accounts.json
+build/
+dist/
+__pycache__/
+*.png
+*.pyc
