@@ -4,10 +4,10 @@ RO Daily Tasks — ro.gnjoylatam.com
 Options:
   1. Check-in (roulette event button)
   2. Dado do Dia — click "CLIQUE!" on midgardtrail, pausing after the click for your input
-  3. Daily Login — click "RECEBER ITEM" on dailylogin
-  4. All of the above (in order: 1 → 2 → 3), no pause
-  5. All of the above, pausing after dado click (wait for your input to continue)
-  6. Check-in + Dado do Dia only (no daily login), pausing after dado click
+  3. Jogar Dado — spend accumulated dice on the trail board (loops until dice count is 0)
+  4. Roulette Spin — click "GIRAR"
+  5. Check-in + Dado do Dia
+  6. Roulette Spin + Jogar Dado
 """
 
 import io
@@ -29,7 +29,6 @@ _BASE = Path(_sys.executable).parent if getattr(_sys, "frozen", False) else Path
 ACCOUNTS_FILE = _BASE / "accounts.json"
 
 URL_MIDGARDTRAIL = "https://ro.gnjoylatam.com/pt/event/anniversary_1st/midgardtrail"
-URL_DAILYLOGIN   = "https://ro.gnjoylatam.com/pt/event/anniversary_1st/dailylogin"
 
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -52,10 +51,10 @@ def ask_option() -> int:
     log("\n=== RO Daily Tasks ===", CYAN)
     log("1. Check-in (roulette event)", YELLOW)
     log("2. Dado do Dia — click 'CLIQUE!' (midgardtrail)", YELLOW)
-    log("3. Daily Login — click 'RECEBER ITEM' (dailylogin)", YELLOW)
-    log("4. All of the above", YELLOW)
-    log("5. All of the above, pausing after dado click (wait for your input to continue)", YELLOW)
-    log("6. Check-in + Dado do Dia only (no daily login), pausing after dado click", YELLOW)
+    log("3. Jogar Dado — spend dice on the trail board (midgardtrail)", YELLOW)
+    log("4. Roulette Spin — click 'GIRAR'", YELLOW)
+    log("5. Check-in + Dado do Dia", YELLOW)
+    log("6. Roulette Spin + Jogar Dado", YELLOW)
     while True:
         choice = input("\nChoose an option (1/2/3/4/5/6): ").strip()
         if choice in ("1", "2", "3", "4", "5", "6"):
@@ -151,23 +150,60 @@ async def ensure_on_page(page, account: dict, target_url: str, session: dict):
 # ── shared turnstile helper ───────────────────────────────────────────────────
 
 async def solve_turnstile_if_present(page, email: str, label: str):
-    """Wait for Turnstile to be solved if a widget is present on the page."""
+    """Wait for Turnstile to be solved if a widget is present on the page.
+
+    The widget (and its hidden response input) renders asynchronously, so a
+    short existence check right after page load can race it and wrongly
+    conclude "no turnstile here" — leading to a click that fires while the
+    "Verificando segurança para acesso" gate is still pending and silently
+    does nothing. Give it a real window to attach before deciding it's absent.
+    """
+    turnstile_input = page.locator("input[name='cf-turnstile-response']").first
     try:
-        turnstile_value = await page.locator("input[name='cf-turnstile-response']").first.get_attribute("value", timeout=2_000)
-        if not turnstile_value:
-            log(
-                f"\n{CYAN}[{email}] ACTION REQUIRED:{RESET} "
-                f"Cloudflare checkbox detected for {label}. "
-                f"Please solve it in the browser window. Waiting...",
-            )
-            await page.wait_for_function(
-                "document.querySelector('input[name=\"cf-turnstile-response\"]')?.value?.length > 0",
-                timeout=120_000,
-            )
-            log(f"[{email}] Turnstile solved!", GREEN)
-            await page.wait_for_timeout(500)
+        await turnstile_input.wait_for(state="attached", timeout=8_000)
     except PlaywrightTimeout:
-        pass  # No Turnstile present, proceed normally
+        return  # No Turnstile on this page, proceed normally
+
+    value = await turnstile_input.get_attribute("value")
+    if value:
+        return  # Already solved (invisible/auto-pass)
+
+    log(
+        f"\n{CYAN}[{email}] ACTION REQUIRED:{RESET} "
+        f"Cloudflare checkbox detected for {label}. "
+        f"Please solve it in the browser window. Waiting...",
+    )
+    await page.wait_for_function(
+        "document.querySelector('input[name=\"cf-turnstile-response\"]')?.value?.length > 0",
+        timeout=120_000,
+    )
+    log(f"[{email}] Turnstile solved!", GREEN)
+    await page.wait_for_timeout(500)
+
+
+# ── shared roulette-page counters ─────────────────────────────────────────────
+
+async def get_presence_days(page) -> int:
+    """Read 'Número de dias de presença: X / N' from the roulette page. -1 if unreadable."""
+    try:
+        text = await page.locator(
+            "dl:has(dt:has-text('Número de dias de presença')) dd span"
+        ).first.inner_text(timeout=5_000)
+        return int(text.strip())
+    except (PlaywrightTimeout, ValueError):
+        return -1
+
+
+async def get_dice_count(page) -> int:
+    """Read 'Número atual de dados' from the midgardtrail page. -1 if unreadable."""
+    try:
+        text = await page.locator(
+            "div[class*='status_card']:has(div[class*='status_label']:has-text('Número atual de dados')) "
+            "div[class*='status_value']"
+        ).first.inner_text(timeout=5_000)
+        return int(text.strip())
+    except (PlaywrightTimeout, ValueError):
+        return -1
 
 
 # ── task 1: check-in ──────────────────────────────────────────────────────────
@@ -180,43 +216,49 @@ async def do_checkin(page, account: dict, event_url: str, session: dict) -> bool
     await page.screenshot(path=str(pre_shot), full_page=True)
     log(f"[{email}] Pre-checkin screenshot: {pre_shot.name}", YELLOW)
 
+    days_before = await get_presence_days(page)
+    log(f"[{email}] Número de dias de presença before: {days_before}", CYAN)
+
     log(f"[{email}] Looking for check-in button...")
-    # Text-based match survives event-to-event CSS module hash changes (e.g. june26roulette
-    # -> july26roulette). Old hashed classes kept as a last-resort fallback.
-    checkin_btn = page.locator(
-        "button:has-text('fazer check-in'), "
-        "button[aria-label='Check-in'], "
-        "button[aria-label='Fazer check-in'], "
-        "button[title='Check-in'], "
-        "button.styles_checkin_button__YOuXP"
-    ).first
+    # The button has no text (it's a background image) and its CSS-module class hash
+    # changes every event build. There are TWO elements sharing the 'checkin_button'
+    # class stem: one is the real check-in button (img srcset .../btn-checkin.webp),
+    # the other is the "reward history" popup button reusing the same styling (img
+    # alt="REWARD HISTORY BUTTON", srcset .../btn-popup-reward.webp) — clicking that
+    # one is what produced the misleading "Nenhum histórico de recompensas da
+    # roleta" alert. Disambiguate via the actual check-in image, not the class name.
+    checkin_btn = page.locator("button:has(img[srcset*='btn-checkin.webp'])").first
 
     try:
         await checkin_btn.wait_for(state="attached", timeout=TIMEOUT)
     except PlaywrightTimeout:
-        already_done = page.locator(
-            "button:has-text('concluído'), "
-            "button:has-text('completed'), "
-            "button[aria-label='Completed'], "
-            "button.styles_complete_button__m12Yr"
-        ).first
-        try:
-            if await already_done.is_visible(timeout=2_000):
-                log(f"[{email}] Already checked in today (Completed).", YELLOW)
-                await page.screenshot(path=str(_BASE / f"checkin_{email.split('@')[0]}.png"))
-                return True
-        except PlaywrightTimeout:
-            pass
         log(f"[{email}] Check-in button not found — event may have ended or the page layout changed.", YELLOW)
         await page.screenshot(path=str(_BASE / f"error_checkin_{email.split('@')[0]}.png"), full_page=True)
         return False
 
+    if await checkin_btn.is_disabled():
+        log(f"[{email}] Already checked in today (button disabled).", YELLOW)
+        await page.screenshot(path=str(_BASE / f"checkin_{email.split('@')[0]}.png"), full_page=True)
+        return True
+
     await checkin_btn.scroll_into_view_if_needed()
     await page.wait_for_timeout(500)
     await solve_turnstile_if_present(page, email, "check-in")
-    await checkin_btn.click(force=True)
+
+    dialog_state = {"text": None}
+
+    async def on_dialog(dialog):
+        dialog_state["text"] = dialog.message
+        log(f"[{email}] Alert popup: {dialog.message}", YELLOW)
+        await dialog.accept()
+
+    # Registered only around the click itself so unrelated page alerts (if any)
+    # aren't mistaken for a check-in rejection.
+    page.on("dialog", on_dialog)
+    await checkin_btn.click()
     log(f"[{email}] Check-in button clicked!", GREEN)
     await page.wait_for_timeout(3_000)
+    page.remove_listener("dialog", on_dialog)
 
     for selector in [
         "button:has-text('Confirmar')",
@@ -235,16 +277,46 @@ async def do_checkin(page, account: dict, event_url: str, session: dict) -> bool
         except PlaywrightTimeout:
             continue
 
-    try:
-        await page.locator(
-            "button[aria-label='Completed'], button.styles_complete_button__m12Yr"
-        ).first.wait_for(state="visible", timeout=5_000)
-        log(f"[{email}] Check-in confirmed — button changed to Completed.", GREEN)
-    except PlaywrightTimeout:
-        log(f"[{email}] Button did not change to Completed (may still be OK).", YELLOW)
+    days_after = await get_presence_days(page)
+    for _ in range(4):
+        if days_before < 0 or days_after == days_before + 1:
+            break
+        await page.wait_for_timeout(1_500)
+        days_after = await get_presence_days(page)
 
+    if days_before >= 0 and days_after == days_before + 1:
+        log(f"[{email}] Check-in confirmed — presence days {days_before} -> {days_after}.", GREEN)
+        await page.screenshot(path=str(_BASE / f"checkin_{email.split('@')[0]}.png"), full_page=True)
+        return True
+
+    # The site appears to run extra bot-detection specifically on this button —
+    # an identical, automated click is consistently rejected (silent no-op or a
+    # generic alert) even though the other buttons on this site click fine
+    # automated. A manual click from here reliably succeeds, so fall back to it
+    # instead of trying to force the automated path.
+    if dialog_state["text"]:
+        log(f"[{email}] Automated click was rejected (alert: '{dialog_state['text']}').", YELLOW)
+    else:
+        log(f"[{email}] Automated click did not register (presence days still {days_after}).", YELLOW)
+    log(
+        f"\n{CYAN}[{email}] ACTION REQUIRED:{RESET} "
+        f"Please click 'FAZER CHECK-IN' yourself in the browser window. Waiting up to 60s...",
+    )
+    for _ in range(40):
+        await page.wait_for_timeout(1_500)
+        days_after = await get_presence_days(page)
+        if days_before >= 0 and days_after == days_before + 1:
+            break
+
+    log(f"[{email}] Número de dias de presença after: {days_after}", CYAN)
     await page.screenshot(path=str(_BASE / f"checkin_{email.split('@')[0]}.png"), full_page=True)
-    return True
+
+    if days_before >= 0 and days_after == days_before + 1:
+        log(f"[{email}] Check-in confirmed — presence days {days_before} -> {days_after}.", GREEN)
+        return True
+
+    log(f"[{email}] Check-in NOT confirmed — presence days {days_before} -> {days_after} (expected {days_before + 1}).", RED)
+    return False
 
 
 # ── task 2: dado do dia ───────────────────────────────────────────────────────
@@ -277,7 +349,7 @@ async def do_dado(page, account: dict, session: dict, pause: bool = False) -> bo
     await clique_btn.scroll_into_view_if_needed()
     await page.wait_for_timeout(500)
     await solve_turnstile_if_present(page, email, "dado do dia")
-    await clique_btn.click(force=True)
+    await clique_btn.click()
     log(f"[{email}] Daily dice button clicked!", GREEN)
     await page.wait_for_timeout(3_000)
 
@@ -309,65 +381,124 @@ async def do_dado(page, account: dict, session: dict, pause: bool = False) -> bo
     return True
 
 
-# ── task 3: daily login ───────────────────────────────────────────────────────
+# ── task 3: jogar dado (spend dice on the trail board) ────────────────────────
 
-async def do_dailylogin(page, account: dict, session: dict) -> bool:
+async def do_jogar_dado(page, account: dict, session: dict) -> bool:
     email = account["email"]
-    await ensure_on_page(page, account, URL_DAILYLOGIN, session)
+    await ensure_on_page(page, account, URL_MIDGARDTRAIL, session)
 
-    # Page content loads lazily — wait for reward buttons to appear before searching
-    log(f"[{email}] Waiting for daily login rewards to render...")
+    dice_count = await get_dice_count(page)
+    log(f"[{email}] Número atual de dados: {dice_count}", CYAN)
+
+    if dice_count <= 0:
+        log(f"[{email}] No dice to play (count is {dice_count}) — skipping jogar dado.", YELLOW)
+        await page.screenshot(path=str(_BASE / f"jogardado_{email.split('@')[0]}.png"), full_page=True)
+        return True
+
+    log(f"[{email}] Looking for 'JOGAR DADO' button...")
+    throw_btn = page.locator("button[class*='throwBtn']").first
     try:
-        await page.locator("button.styles_reward_btn__y7X7y").first.wait_for(state="attached", timeout=TIMEOUT)
+        await throw_btn.wait_for(state="visible", timeout=TIMEOUT)
     except PlaywrightTimeout:
-        log(f"[{email}] Daily login reward buttons never appeared — event may have ended.", YELLOW)
-        await page.screenshot(path=str(_BASE / f"dailylogin_{email.split('@')[0]}.png"), full_page=True)
+        log(f"[{email}] 'JOGAR DADO' button not found — page layout may have changed.", YELLOW)
+        await page.screenshot(path=str(_BASE / f"jogardado_{email.split('@')[0]}.png"), full_page=True)
         return False
 
-    log(f"[{email}] Looking for 'RECEBER ITEM' button...")
+    await solve_turnstile_if_present(page, email, "jogar dado")
 
-    receber_btn = page.locator("button.styles_reward_btn__y7X7y:not([disabled])").first
+    max_iterations = 60
+    for _ in range(max_iterations):
+        current = await get_dice_count(page)
+        if current <= 0:
+            break
 
+        await throw_btn.scroll_into_view_if_needed()
+        await page.wait_for_timeout(300)
+        await throw_btn.click()
+        log(f"[{email}] 'JOGAR DADO' clicked (dice before click: {current})...", GREEN)
+        await page.wait_for_timeout(2_500)
+
+        for selector in [
+            "button:has-text('Confirmar')",
+            "button:has-text('Confirm')",
+            "button:has-text('OK')",
+            "button:has-text('ok')",
+            "button:has-text('Fechar')",
+            "button:has-text('Close')",
+        ]:
+            try:
+                btn = page.locator(selector).first
+                if await btn.is_visible(timeout=1_500):
+                    await btn.click()
+                    log(f"[{email}] Modal dismissed.", GREEN)
+                    await page.wait_for_timeout(1_000)
+                    break
+            except PlaywrightTimeout:
+                continue
+
+        new_count = await get_dice_count(page)
+        if new_count < current:
+            log(f"[{email}] Dice count went down: {current} -> {new_count}.", GREEN)
+        elif new_count > current:
+            log(f"[{email}] Dice count went up: {current} -> {new_count} (landed on a bonus tile) — continuing.", YELLOW)
+            await page.wait_for_timeout(1_000)
+        else:
+            log(f"[{email}] Dice count unchanged ({current}) — stopping to avoid an infinite loop.", RED)
+            break
+    else:
+        log(f"[{email}] Reached max iterations ({max_iterations}) — stopping.", YELLOW)
+
+    final_count = await get_dice_count(page)
+    await page.screenshot(path=str(_BASE / f"jogardado_{email.split('@')[0]}.png"), full_page=True)
+
+    if final_count == 0:
+        log(f"[{email}] Jogar dado done — all dice used (count reached 0).", GREEN)
+        return True
+
+    log(f"[{email}] Jogar dado stopped with {final_count} dice remaining.", YELLOW)
+    return False
+
+
+# ── task 4: roulette spin ─────────────────────────────────────────────────────
+
+async def do_roulette_spin(page, account: dict, event_url: str, session: dict) -> bool:
+    email = account["email"]
+    await ensure_on_page(page, account, event_url, session)
+
+    log(f"[{email}] Looking for roulette 'GIRAR' button...")
+    girar_btn = page.locator("button[class*='roulette_button']").first
     try:
-        await receber_btn.wait_for(state="visible", timeout=TIMEOUT)
-        btn_text = (await receber_btn.inner_text()).strip()
-        if btn_text != "RECEBER ITEM":
-            log(f"[{email}] No 'RECEBER ITEM' button — first available button says '{btn_text}'. Already claimed?", YELLOW)
-            await page.screenshot(path=str(_BASE / f"dailylogin_{email.split('@')[0]}.png"), full_page=True)
-            return True
+        await girar_btn.wait_for(state="visible", timeout=TIMEOUT)
     except PlaywrightTimeout:
-        log(f"[{email}] 'RECEBER ITEM' button not found — may already be claimed today.", YELLOW)
-        await page.screenshot(path=str(_BASE / f"dailylogin_{email.split('@')[0]}.png"), full_page=True)
+        log(f"[{email}] 'GIRAR' button not found — page layout may have changed.", YELLOW)
+        await page.screenshot(path=str(_BASE / f"roulette_{email.split('@')[0]}.png"), full_page=True)
         return False
 
-    await receber_btn.scroll_into_view_if_needed()
-    await page.wait_for_timeout(500)
-    await solve_turnstile_if_present(page, email, "daily login")
-    await receber_btn.click(force=True)
-    log(f"[{email}] 'RECEBER ITEM' clicked!", GREEN)
-    await page.wait_for_timeout(3_000)
+    dialog_state = {"text": None}
 
-    # Dismiss any confirmation/reward modal
-    for selector in [
-        "button:has-text('Confirmar')",
-        "button:has-text('Confirm')",
-        "button:has-text('OK')",
-        "button:has-text('ok')",
-        "button:has-text('Fechar')",
-        "button:has-text('Close')",
-    ]:
-        try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=2_000):
-                await btn.click()
-                log(f"[{email}] Modal dismissed.", GREEN)
-                await page.wait_for_timeout(1_000)
-                break
-        except PlaywrightTimeout:
-            continue
+    async def on_dialog(dialog):
+        dialog_state["text"] = dialog.message
+        log(f"[{email}] Alert popup: {dialog.message}", YELLOW)
+        await dialog.accept()
 
-    await page.screenshot(path=str(_BASE / f"dailylogin_{email.split('@')[0]}.png"), full_page=True)
-    log(f"[{email}] Daily login done.", GREEN)
+    page.on("dialog", on_dialog)
+    try:
+        await girar_btn.scroll_into_view_if_needed()
+        await page.wait_for_timeout(500)
+        await solve_turnstile_if_present(page, email, "roulette spin")
+        await girar_btn.click()
+        log(f"[{email}] 'GIRAR' clicked!", GREEN)
+        await page.wait_for_timeout(3_000)
+    finally:
+        page.remove_listener("dialog", on_dialog)
+
+    await page.screenshot(path=str(_BASE / f"roulette_{email.split('@')[0]}.png"), full_page=True)
+
+    if dialog_state["text"]:
+        log(f"[{email}] Roulette spin confirmed — alert shown: '{dialog_state['text']}'.", GREEN)
+        return True
+
+    log(f"[{email}] No alert appeared after clicking GIRAR — check the screenshot to see what happened.", YELLOW)
     return True
 
 
@@ -394,8 +525,10 @@ async def process_account(account: dict, playwright, tasks: list[str], checkin_u
                     results["dado"] = await do_dado(page, account, session)
                 elif task == "dado_pause":
                     results["dado"] = await do_dado(page, account, session, pause=True)
-                elif task == "dailylogin":
-                    results["dailylogin"] = await do_dailylogin(page, account, session)
+                elif task == "jogar_dado":
+                    results["jogar_dado"] = await do_jogar_dado(page, account, session)
+                elif task == "roulette_spin":
+                    results["roulette_spin"] = await do_roulette_spin(page, account, checkin_url, session)
             except PlaywrightTimeout as e:
                 log(f"[{email}] TIMEOUT on {task}: {e}", RED)
                 results[task] = False
@@ -418,10 +551,10 @@ async def main():
     task_map = {
         1: ["checkin"],
         2: ["dado_pause"],
-        3: ["dailylogin"],
-        4: ["checkin", "dado", "dailylogin"],
-        5: ["checkin", "dado_pause", "dailylogin"],
-        6: ["checkin", "dado_pause"],
+        3: ["jogar_dado"],
+        4: ["roulette_spin"],
+        5: ["checkin", "dado_pause"],
+        6: ["roulette_spin", "jogar_dado"],
     }
     tasks = task_map[option]
 
