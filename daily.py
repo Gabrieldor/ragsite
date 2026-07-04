@@ -7,7 +7,7 @@ Options:
   3. Jogar Dado — spend accumulated dice on the trail board (loops until dice count is 0)
   4. Roulette Spin — click "GIRAR"
   5. Check-in + Dado do Dia
-  6. Roulette Spin + Jogar Dado
+  6. Check-in + Dado do Dia + Roulette Spin + Jogar Dado
 """
 
 import io
@@ -54,7 +54,7 @@ def ask_option() -> int:
     log("3. Jogar Dado — spend dice on the trail board (midgardtrail)", YELLOW)
     log("4. Roulette Spin — click 'GIRAR'", YELLOW)
     log("5. Check-in + Dado do Dia", YELLOW)
-    log("6. Roulette Spin + Jogar Dado", YELLOW)
+    log("6. Check-in + Dado do Dia + Roulette Spin + Jogar Dado", YELLOW)
     while True:
         choice = input("\nChoose an option (1/2/3/4/5/6): ").strip()
         if choice in ("1", "2", "3", "4", "5", "6"):
@@ -124,6 +124,11 @@ async def do_login(page, account: dict, redirect_url: str):
 async def ensure_on_page(page, account: dict, target_url: str, session: dict):
     """Navigate to target_url and handle login only if not already logged in this session."""
     email = account["email"]
+
+    if session.get("logged_in") and page.url.rstrip("/") == target_url.rstrip("/"):
+        log(f"[{email}] Already on {target_url} — skipping reload.", GREEN)
+        return
+
     log(f"[{email}] Navigating to {target_url} ...")
     await page.goto(target_url, wait_until="domcontentloaded", timeout=TIMEOUT)
     await page.wait_for_timeout(3_000)
@@ -218,6 +223,19 @@ async def do_checkin(page, account: dict, event_url: str, session: dict) -> bool
 
     days_before = await get_presence_days(page)
     log(f"[{email}] Número de dias de presença before: {days_before}", CYAN)
+
+    # Once today's check-in is done, the site swaps the button image for
+    # btn-complete.webp (no text, just like the other button states) — a
+    # completely different image than btn-checkin.webp, so the check-in button
+    # lookup below would fail and get misreported as "not found / event ended".
+    # Detect this first so we skip cleanly instead of falling through to the
+    # manual-click fallback (which would otherwise sit there for ~60s per
+    # account for no reason).
+    already_registered = await page.locator("img[srcset*='btn-complete.webp']").first.is_visible(timeout=3_000)
+    if already_registered:
+        log(f"[{email}] Already checked in today (btn-complete image shown).", YELLOW)
+        await page.screenshot(path=str(_BASE / f"checkin_{email.split('@')[0]}.png"), full_page=True)
+        return True
 
     log(f"[{email}] Looking for check-in button...")
     # The button has no text (it's a background image) and its CSS-module class hash
@@ -341,7 +359,10 @@ async def do_dado(page, account: dict, session: dict, pause: bool = False) -> bo
         await page.screenshot(path=str(_BASE / f"dado_{email.split('@')[0]}.png"), full_page=True)
         return False
 
-    if await clique_btn.is_disabled():
+    already_claimed = await clique_btn.evaluate(
+        "el => el.disabled || el.className.includes('disabled') || el.getAttribute('aria-disabled') === 'true'"
+    )
+    if already_claimed:
         log(f"[{email}] Daily dice already claimed today (button disabled).", YELLOW)
         await page.screenshot(path=str(_BASE / f"dado_{email.split('@')[0]}.png"), full_page=True)
         return True
@@ -386,6 +407,7 @@ async def do_dado(page, account: dict, session: dict, pause: bool = False) -> bo
 async def do_jogar_dado(page, account: dict, session: dict) -> bool:
     email = account["email"]
     await ensure_on_page(page, account, URL_MIDGARDTRAIL, session)
+    await page.wait_for_timeout(1_500)
 
     dice_count = await get_dice_count(page)
     log(f"[{email}] Número atual de dados: {dice_count}", CYAN)
@@ -416,7 +438,7 @@ async def do_jogar_dado(page, account: dict, session: dict) -> bool:
         await page.wait_for_timeout(300)
         await throw_btn.click()
         log(f"[{email}] 'JOGAR DADO' clicked (dice before click: {current})...", GREEN)
-        await page.wait_for_timeout(2_500)
+        await page.wait_for_timeout(4_000)
 
         for selector in [
             "button:has-text('Confirmar')",
@@ -436,6 +458,10 @@ async def do_jogar_dado(page, account: dict, session: dict) -> bool:
             except PlaywrightTimeout:
                 continue
 
+        # Give the trail-board animation and stats panel time to settle before
+        # reading the updated count — reading too soon can catch a stale value
+        # and wrongly conclude "unchanged" or "went up" mid-animation.
+        await page.wait_for_timeout(2_000)
         new_count = await get_dice_count(page)
         if new_count < current:
             log(f"[{email}] Dice count went down: {current} -> {new_count}.", GREEN)
@@ -554,7 +580,7 @@ async def main():
         3: ["jogar_dado"],
         4: ["roulette_spin"],
         5: ["checkin", "dado_pause"],
-        6: ["roulette_spin", "jogar_dado"],
+        6: ["checkin", "roulette_spin", "dado", "jogar_dado"],
     }
     tasks = task_map[option]
 
